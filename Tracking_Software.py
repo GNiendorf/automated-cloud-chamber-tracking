@@ -16,7 +16,7 @@ from scipy.ndimage import measurements
 from scipy.ndimage.measurements import label
 
 parser = OptionParser()
-parser.add_option('--fb', action="store", type="int", dest="framebuff", help="frames a track has to be in view to count", default=1)
+parser.add_option('--fb', action="store", type="int", dest="framebuff", help="frames a track has to be in view to count", default=5)
 parser.add_option('--border', action="store", dest="border", help="border cropped out", default=[30, 30])
 parser.add_option('--meanshift', action="store", type="int", dest="meanshift", help="maximum mean shift per frame", default=25)
 parser.add_option('--denoise', action="store", type="int", dest="denoise_thresh", help="denoise threshold", default=500)
@@ -24,6 +24,13 @@ parser.add_option('--convert', action="store", type="int", dest="convert", help=
 parser.add_option('--video', action="store", type="string", dest="video", help="video file name", default="1hour.mp4")
 parser.add_option('--output', action="store", type="string", dest="output", help="output file name", default="tracks.csv")
 opt, args = parser.parse_args()
+
+framebuff = opt.framebuff
+border = opt.border
+meanshift_length = opt.meanshift
+denoise_thresh = opt.denoise_thresh
+pix_per_cm = opt.convert
+video = opt.video
 
 def denoise(image, nthresh):
     """Return the signal that is above nthresh"""
@@ -39,12 +46,12 @@ def get_length(idx_lists):
     start = [idx_lists[0][0], idx_lists[1][0]]
     end = [idx_lists[0][-1], idx_lists[1][-1]]
     dis = distance.euclidean(start, end)
-    return dis
+    return (dis / pix_per_cm)
 
 def get_area(idx_lists):
     """Return the area of a track"""
     binc = np.bincount(idx_lists.ravel())
-    return binc
+    return (binc / pix_per_cm**2)
 
 def train_bkg(cap, nframes, fgbg, border):
     """Return the trained background remover"""
@@ -70,39 +77,25 @@ def remove_border_tracks(image):
         image[image == val4] = 0  
     return image 
 
-framebuff = opt.framebuff
-border = opt.border
-meanshift_length = opt.meanshift
-denoise_thresh = opt.denoise_thresh
-pix_per_cm = opt.convert
-video = opt.video
-
 if not os.path.isfile(video):
     sys.exit("Exception: file %s does not exist!" % video)
 
 print("Loading video from file")
 cap = cv2.VideoCapture(opt.video)
 
+final_frame = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))-1
+if final_frame <= 0:
+    sys.exit("Exception: video has no frames")
+
 print("Training background remover")
 fgbg = cv2.createBackgroundSubtractorMOG2(detectShadows=False) #Initialize background remover
-fgbg = train_bkg(cap, 1000, fgbg, border) #Train background remover
+fgbg = train_bkg(cap, min(1000, .8*final_frame), fgbg, border) #Train background remover
 
-len_abs = []
-area_abs = []
-frames_abs = []
-
-len_buffer = []
-area_buffer = []
-frame_buffer = []
-mean_buffer = []
-
+final = []
+buffers = []
 seen = []
 
 current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-final_frame = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))-1
-
-if final_frame <= 0:
-    sys.exit("Exception: video has no frames")
 
 print("Starting analysis")
 for tick in tqdm(np.arange(final_frame-current_frame)):
@@ -137,41 +130,33 @@ for tick in tqdm(np.arange(final_frame-current_frame)):
         length = get_length(idxs)
         area = get_area(clusters)[lab]
         #Try to identify if this track was seen last frame
-        for idx, val in enumerate(mean_buffer):
-            dis = distance.euclidean(val, mean)
+        for idx, val in enumerate(buffers):
+            dis = distance.euclidean(val[0], mean)
             if dis < meanshift_length:
                 seen_flag=1
-                frame_buffer[idx] += 1
                 seen[idx] = 1
-                mean_buffer[idx] = mean
+                buffers[idx][0] = mean
+                buffers[idx][1] += 1
                 #Only add to buffer the maximum for each track
-                if length > len_buffer[idx]:
-                    len_buffer[idx] = length
-                if area > area_buffer[idx]:
-                    area_buffer[idx] = area
+                if length > buffers[idx][2]:
+                    buffers[idx][2] = length
+                if area > buffers[idx][3]:
+                    buffers[idx][3] = area
         #If a track is new, add it to buffer lists
         if not seen_flag:
             seen.append(1)
-            frame_buffer.append(1)
-            mean_buffer.append(mean)
-            len_buffer.append(length)
-            area_buffer.append(area)
+            buffers.append([mean, 1, length, area])
 
-    #Selects tracks which disapeered from the last frame.
-    #Need to reverse idx order since we remove by index.
+    #Selects tracks which disapeared from the last frame and removes them from buffer.
     for idx in np.where(np.array(seen) == 0)[0][::-1]:
         #If a track was in view above the threshold append it to the abs lists
-        if frame_buffer[idx] > framebuff:
-            frames_abs.append(frame_buffer[idx])
-            len_abs.append(len_buffer[idx]/(pix_per_cm))
-            area_abs.append(area_buffer[idx]/(pix_per_cm**2))
-        #Delete a track from the buffer when it disapeers
-        del len_buffer[idx]
+        if buffers[idx][1] > framebuff:
+            final.append(buffers[idx])
+        del buffers[idx]
         del seen[idx]
-        del mean_buffer[idx]
-        del area_buffer[idx]
-        del frame_buffer[idx]
 
-data = pd.DataFrame({"Lengths":len_abs, "Areas":area_abs, "Frames":frames_abs, "Video":video})
+final = np.array(final)
+print("Saving results in %s" % opt.output)
+data = pd.DataFrame({"Lengths":final[:,2], "Areas":final[:,3], "Frames":final[:,1], "Video":video})
 data.to_csv(opt.output, index=False)
 
